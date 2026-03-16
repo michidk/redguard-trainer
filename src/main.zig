@@ -1,4 +1,5 @@
 const std = @import("std");
+const clap = @import("clap");
 const windows = std.os.windows;
 const fs = std.fs;
 
@@ -32,10 +33,8 @@ extern "kernel32" fn CloseHandle(hObj: HANDLE) callconv(.winapi) BOOL;
 extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
 extern "kernel32" fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *DWORD) callconv(.winapi) DWORD;
 extern "user32" fn FindWindowA(lpClass: ?[*:0]const u8, lpWindow: ?[*:0]const u8) callconv(.winapi) ?HWND;
-extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
-extern "user32" fn keybd_event(bVk: u8, bScan: u8, dwFlags: DWORD, dwExtra: usize) callconv(.winapi) void;
 
-// ── Helpers ──
+// ── Output helpers ──
 fn print(comptime msg: []const u8) void {
     fs.File.stdout().writeAll(msg) catch {};
 }
@@ -50,7 +49,7 @@ fn sleep(ms: u64) void {
     std.Thread.sleep(ms * std.time.ns_per_ms);
 }
 
-// ── DLL Injection ──
+// ── DLL injection ──
 fn injectDll(pid: DWORD, dll_path: []const u8) !void {
     const process = OpenProcess(PROCESS_ALL_ACCESS, 0, pid) orelse {
         printFmt("  OpenProcess failed: {d}\n", .{GetLastError()});
@@ -82,7 +81,7 @@ fn injectDll(pid: DWORD, dll_path: []const u8) !void {
 }
 
 // ── RGFX.EXE binary patching ──
-const W: u8 = 0xAA; // wildcard sentinel — matches any byte in pattern search
+const W: u8 = 0xAA; // wildcard — matches any byte in pattern search
 
 fn patchByte(path: []const u8, offset: usize, byte: u8) bool {
     const f = fs.openFileAbsolute(path, .{ .mode = .read_write }) catch return false;
@@ -112,62 +111,73 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Parse game path from args
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-    _ = args.next(); // skip exe name
+    // ── CLI argument parsing ──
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help            Show this help message
+        \\-s, --skip-intro      Skip intro cinematic, 3dfx splash, and outro animation
+        \\<str>                 Path to Redguard installation (contains DOSBOX/ folder)
+        \\
+    );
 
-    const game_dir = args.next() orelse {
-        print("Usage: redguard-trainer [options] <game-path>\n\n");
-        print("  <game-path>    Path to the Redguard installation directory\n");
-        print("                 (contains DOSBOX/ folder and dosbox_redguard.conf)\n\n");
-        print("Options:\n");
-        print("  --skip-intro   Skip intro cinematics\n\n");
-        print("Example:\n");
-        print("  redguard-trainer --skip-intro \"D:\\Games\\GOG Galaxy\\Redguard\"\n");
+    var diag: clap.Diagnostic = .{};
+    var res = clap.parse(clap.Help, &params, .{ .str = clap.parsers.string }, .{ .diagnostic = &diag, .allocator = allocator }) catch |err| {
+        diag.reportToFile(fs.File.stderr(), err) catch {};
+        return err;
+    };
+    defer res.deinit();
+
+    const help_text =
+        \\Usage: redguard-trainer [options] <game-path>
+        \\
+        \\Options:
+        \\  -s, --skip-intro  Skip intro cinematic, 3dfx splash, and outro animation
+        \\  -h, --help        Show this help message
+        \\
+        \\Arguments:
+        \\  <game-path>       Path to Redguard installation (contains DOSBOX/ folder)
+        \\
+        \\Example:
+        \\  redguard-trainer --skip-intro "D:\Games\GOG Galaxy\Redguard"
+        \\
+    ;
+
+    if (res.args.help != 0) {
+        print(help_text);
+        return;
+    }
+
+    const game_path: []const u8 = if (res.positionals.len > 0) (res.positionals[0] orelse {
+        print("Error: missing <game-path>\n\n");
+        print(help_text);
+        return;
+    }) else {
+        print("Error: missing <game-path>\n\n");
+        print(help_text);
         return;
     };
 
-    // Check for --skip-intro (may appear before or after game_dir)
-    var skip_intro = false;
-    if (std.mem.eql(u8, game_dir, "--skip-intro")) {
-        skip_intro = true;
-    }
-    // Check remaining args
-    var actual_game_dir = game_dir;
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--skip-intro")) {
-            skip_intro = true;
-        } else {
-            actual_game_dir = arg;
-        }
-    }
-    if (skip_intro and std.mem.eql(u8, actual_game_dir, "--skip-intro")) {
-        print("Error: missing <game-path>\n");
-        return;
-    }
-    const game_path = actual_game_dir;
+    const skip_intro = res.args.@"skip-intro" != 0;
 
-    // Build paths relative to game path
+    // ── Build paths ──
     var dosbox_exe_buf: [fs.max_path_bytes]u8 = undefined;
     var conf_main_buf: [fs.max_path_bytes]u8 = undefined;
-    var conf_game_buf: [fs.max_path_bytes]u8 = undefined;
     var dosbox_dir_buf: [fs.max_path_bytes]u8 = undefined;
     var conf_tmp_buf: [fs.max_path_bytes]u8 = undefined;
+    var rgfx_exe_buf: [fs.max_path_bytes]u8 = undefined;
 
     const dosbox_exe = std.fmt.bufPrint(&dosbox_exe_buf, "{s}\\DOSBOX\\dosbox.exe", .{game_path}) catch return;
     const dosbox_dir = std.fmt.bufPrint(&dosbox_dir_buf, "{s}\\DOSBOX", .{game_path}) catch return;
     const conf_main = std.fmt.bufPrint(&conf_main_buf, "{s}\\dosbox_redguard.conf", .{game_path}) catch return;
-    const conf_game = std.fmt.bufPrint(&conf_game_buf, "{s}\\dosbox_redguard_single.conf", .{game_path}) catch return;
     const conf_tmp = std.fmt.bufPrint(&conf_tmp_buf, "{s}\\DOSBOX\\trainer_autoexec.conf", .{game_path}) catch return;
+    const rgfx_exe = std.fmt.bufPrint(&rgfx_exe_buf, "{s}\\Redguard\\RGFX.EXE", .{game_path}) catch return;
 
     dosbox_exe_buf[dosbox_exe.len] = 0;
     dosbox_dir_buf[dosbox_dir.len] = 0;
     conf_main_buf[conf_main.len] = 0;
-    conf_game_buf[conf_game.len] = 0;
     conf_tmp_buf[conf_tmp.len] = 0;
+    rgfx_exe_buf[rgfx_exe.len] = 0;
 
-    // Write temp DOSBox config: override fullscreen=false + autoexec
+    // ── Write temp DOSBox config ──
     {
         const tmp_content =
             "[sdl]\r\n" ++
@@ -195,34 +205,22 @@ pub fn main() !void {
     }
     defer fs.deleteFileAbsolute(conf_tmp) catch {};
 
-    // Patch RGFX.EXE to skip intro cinematics (single byte: JZ→JMP)
-    // Pattern: 83 3D BD 38 1A 00 00 74 0C C7 45 F0 8A 13
-    //          CMP [DAT_001a38bd],0 / JZ +0C / MOV [EBP-10],0x138a
-    //          Patch byte at offset +7: 0x74 (JZ) → 0xEB (JMP)
-    var rgfx_exe_buf: [fs.max_path_bytes]u8 = undefined;
-    const rgfx_exe = std.fmt.bufPrint(&rgfx_exe_buf, "{s}\\Redguard\\RGFX.EXE", .{game_path}) catch return;
-    rgfx_exe_buf[rgfx_exe.len] = 0;
-
-    // Patch 1: Skip intro — JZ→JMP at intro flag check
-    // ASM: CMP dword [DAT_intro_flag], 0 / JZ +0C / MOV [EBP-0x10], 0x138a
+    // ── Patch RGFX.EXE (intro/outro skip) ──
     // Wildcard (W) on address bytes for LE relocation compatibility
     const intro_pattern = [_]u8{ 0x83, 0x3D, W, W, W, W, 0x00, 0x74, 0x0C, 0xC7, 0x45, 0xF0, 0x8A, 0x13 };
-    const intro_patch_offset: usize = 7;
-    const intro_orig = [_]u8{0x74};
-    const intro_patch = [_]u8{0xEB};
-
-    // Patch 2: Skip outro book-close animation — MOV ECX,2 → JMP +0x73
-    // ASM: JNZ +7C / MOV byte [DAT_quit_flag], 2 / MOV ECX, 2
     const outro_pattern = [_]u8{ 0x75, 0x7C, 0xC6, 0x05, W, W, W, W, 0x02, 0xB9, 0x02, 0x00, 0x00, 0x00 };
-    const outro_patch_offset: usize = 9;
-    const outro_orig = [_]u8{ 0xB9, 0x02 };
-    const outro_patch = [_]u8{ 0xEB, 0x73 };
 
-    const Patch = struct { offset: usize, orig: []const u8, applied: bool };
-    var patches = [_]Patch{
-        .{ .offset = 0, .orig = &intro_orig, .applied = false },
-        .{ .offset = 0, .orig = &outro_orig, .applied = false },
+    const PatchDef = struct { pattern: []const u8, offset: usize, patch: []const u8, orig: []const u8, name: []const u8 };
+    const patch_defs = [_]PatchDef{
+        .{ .pattern = &intro_pattern, .offset = 7, .patch = &.{0xEB}, .orig = &.{0x74}, .name = "intro skip (JZ->JMP)" },
+        .{ .pattern = &outro_pattern, .offset = 9, .patch = &.{ 0xEB, 0x73 }, .orig = &.{ 0xB9, 0x02 }, .name = "outro skip (JMP over anims)" },
     };
+
+    const PatchState = struct { offset: usize, orig: []const u8, applied: bool };
+    var patches: [patch_defs.len]PatchState = undefined;
+    for (&patches, 0..) |*p, i| {
+        p.* = .{ .offset = 0, .orig = patch_defs[i].orig, .applied = false };
+    }
 
     if (skip_intro) apply_patches: {
         print("Patching RGFX.EXE...\n");
@@ -230,7 +228,6 @@ pub fn main() !void {
             print("Warning: could not open RGFX.EXE for patching\n");
             break :apply_patches;
         };
-
         const rgfx_data = rgfx_file.readToEndAlloc(allocator, 8 * 1024 * 1024) catch {
             print("Warning: could not read RGFX.EXE\n");
             rgfx_file.close();
@@ -239,17 +236,11 @@ pub fn main() !void {
         rgfx_file.close();
         defer allocator.free(rgfx_data);
 
-        const PatternInfo = struct { pattern: []const u8, offset: usize, patch: []const u8, name: []const u8 };
-        const pattern_list = [_]PatternInfo{
-            .{ .pattern = &intro_pattern, .offset = intro_patch_offset, .patch = &intro_patch, .name = "intro skip (JZ->JMP)" },
-            .{ .pattern = &outro_pattern, .offset = outro_patch_offset, .patch = &outro_patch, .name = "outro skip (JMP over anims)" },
-        };
-
-        for (&pattern_list, 0..) |info, idx| {
-            if (findPattern(rgfx_data, info.pattern)) |i| {
-                const file_off = i + info.offset;
+        for (&patch_defs, 0..) |def, idx| {
+            if (findPattern(rgfx_data, def.pattern)) |i| {
+                const file_off = i + def.offset;
                 var ok = true;
-                for (info.patch, 0..) |byte, j| {
+                for (def.patch, 0..) |byte, j| {
                     if (!patchByte(rgfx_exe, file_off + j, byte)) {
                         ok = false;
                         break;
@@ -258,15 +249,14 @@ pub fn main() !void {
                 if (ok) {
                     patches[idx].offset = file_off;
                     patches[idx].applied = true;
-                    printFmt("  0x{x}: {s}\n", .{ file_off, info.name });
+                    printFmt("  0x{x}: {s}\n", .{ file_off, def.name });
                 }
             } else {
-                printFmt("  Warning: pattern not found for {s}\n", .{info.name});
+                printFmt("  Warning: pattern not found for {s}\n", .{def.name});
             }
         }
     }
 
-    // Restore RGFX.EXE after DOSBox exits
     defer {
         var restored = false;
         for (&patches) |*p| {
@@ -281,7 +271,7 @@ pub fn main() !void {
         if (restored) print("RGFX.EXE restored.\n");
     }
 
-    // Resolve hook DLL path (next to our exe)
+    // ── Resolve hook DLL path ──
     const self_path = try fs.selfExePathAlloc(allocator);
     defer allocator.free(self_path);
     const self_dir = fs.path.dirname(self_path) orelse ".";
@@ -289,13 +279,11 @@ pub fn main() !void {
     const dll_path = std.fmt.bufPrint(&dll_buf, "{s}\\redguard_hook.dll", .{self_dir}) catch return;
     dll_buf[dll_path.len] = 0;
 
+    // ── Launch ──
     printFmt("Game dir:  {s}\n", .{game_path});
-    printFmt("DOSBox:    {s}\n", .{dosbox_exe});
-    printFmt("Hook DLL:  {s}\n", .{dll_path});
-    if (skip_intro) print("Intro:     SKIP (binary patch)\n");
-
-    // Launch DOSBox with our temp config (overrides fullscreen + optionally skips intro)
+    if (skip_intro) print("Intro:     SKIP\n");
     print("Launching DOSBox...\n");
+
     var child = std.process.Child.init(
         &.{ dosbox_exe, "-conf", conf_main, "-conf", conf_tmp, "-noconsole" },
         allocator,
@@ -306,8 +294,7 @@ pub fn main() !void {
     child.stderr_behavior = .Inherit;
     try child.spawn();
 
-    // Wait for SDL window
-    print("Waiting for SDL window...\n");
+    // ── Wait for SDL window + inject ──
     var hwnd: HWND = undefined;
     while (true) {
         if (FindWindowA("SDL_app", null)) |found| {
@@ -317,7 +304,6 @@ pub fn main() !void {
         sleep(200);
     }
 
-    // Get PID and inject
     var pid: DWORD = 0;
     _ = GetWindowThreadProcessId(hwnd, &pid);
     printFmt("DOSBox PID: {d} — injecting hook...\n", .{pid});

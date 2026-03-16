@@ -21,13 +21,17 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(hook_dll);
 
-    // Trainer exe — launches DOSBox, injects DLL, resizes window
+    // Trainer exe — launches DOSBox, injects DLL
+    const clap = b.dependency("clap", .{});
     const exe = b.addExecutable(.{
         .name = "redguard-trainer",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "clap", .module = clap.module("clap") },
+            },
         }),
     });
     b.installArtifact(exe);
