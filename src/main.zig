@@ -81,7 +81,9 @@ fn injectDll(pid: DWORD, dll_path: []const u8) !void {
     _ = VirtualFreeEx(process, remote_mem, 0, MEM_RELEASE);
 }
 
-// ── RGFX.EXE patch restore ──
+// ── RGFX.EXE binary patching ──
+const W: u8 = 0xAA; // wildcard sentinel — matches any byte in pattern search
+
 fn patchByte(path: []const u8, offset: usize, byte: u8) bool {
     const f = fs.openFileAbsolute(path, .{ .mode = .read_write }) catch return false;
     defer f.close();
@@ -89,13 +91,19 @@ fn patchByte(path: []const u8, offset: usize, byte: u8) bool {
     return true;
 }
 
-fn restoreRgfx(patched: bool, path: []const u8, offset: usize) void {
-    if (!patched) return;
-    if (patchByte(path, offset, 0x74)) {
-        print("RGFX.EXE restored (intro patch reverted).\n");
-    } else {
-        print("Warning: could not restore RGFX.EXE\n");
+fn findPattern(data: []const u8, pattern: []const u8) ?usize {
+    if (data.len < pattern.len) return null;
+    for (0..data.len - pattern.len) |i| {
+        var match = true;
+        for (pattern, 0..) |p, j| {
+            if (p != W and data[i + j] != p) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return i;
     }
+    return null;
 }
 
 // ── Main ──
@@ -195,45 +203,83 @@ pub fn main() !void {
     const rgfx_exe = std.fmt.bufPrint(&rgfx_exe_buf, "{s}\\Redguard\\RGFX.EXE", .{game_path}) catch return;
     rgfx_exe_buf[rgfx_exe.len] = 0;
 
-    const intro_pattern = [_]u8{ 0x83, 0x3D, 0xBD, 0x38, 0x1A, 0x00, 0x00, 0x74, 0x0C, 0xC7, 0x45, 0xF0, 0x8A, 0x13 };
-    const patch_offset: usize = 7; // byte index of JZ within the pattern
-    var rgfx_patched = false;
-    var rgfx_patch_file_offset: usize = 0;
+    // Patch 1: Skip intro — JZ→JMP at intro flag check
+    // ASM: CMP dword [DAT_intro_flag], 0 / JZ +0C / MOV [EBP-0x10], 0x138a
+    // Wildcard (W) on address bytes for LE relocation compatibility
+    const intro_pattern = [_]u8{ 0x83, 0x3D, W, W, W, W, 0x00, 0x74, 0x0C, 0xC7, 0x45, 0xF0, 0x8A, 0x13 };
+    const intro_patch_offset: usize = 7;
+    const intro_orig = [_]u8{0x74};
+    const intro_patch = [_]u8{0xEB};
 
-    if (skip_intro) patch_intro: {
-        print("Patching RGFX.EXE to skip intro...\n");
+    // Patch 2: Skip outro book-close animation — MOV ECX,2 → JMP +0x73
+    // ASM: JNZ +7C / MOV byte [DAT_quit_flag], 2 / MOV ECX, 2
+    const outro_pattern = [_]u8{ 0x75, 0x7C, 0xC6, 0x05, W, W, W, W, 0x02, 0xB9, 0x02, 0x00, 0x00, 0x00 };
+    const outro_patch_offset: usize = 9;
+    const outro_orig = [_]u8{ 0xB9, 0x02 };
+    const outro_patch = [_]u8{ 0xEB, 0x73 };
+
+    const Patch = struct { offset: usize, orig: []const u8, applied: bool };
+    var patches = [_]Patch{
+        .{ .offset = 0, .orig = &intro_orig, .applied = false },
+        .{ .offset = 0, .orig = &outro_orig, .applied = false },
+    };
+
+    if (skip_intro) apply_patches: {
+        print("Patching RGFX.EXE...\n");
         const rgfx_file = fs.openFileAbsolute(rgfx_exe, .{ .mode = .read_write }) catch {
             print("Warning: could not open RGFX.EXE for patching\n");
-            break :patch_intro;
+            break :apply_patches;
         };
 
         const rgfx_data = rgfx_file.readToEndAlloc(allocator, 8 * 1024 * 1024) catch {
             print("Warning: could not read RGFX.EXE\n");
             rgfx_file.close();
-            break :patch_intro;
+            break :apply_patches;
         };
+        rgfx_file.close();
         defer allocator.free(rgfx_data);
 
-        // Search for the pattern
-        for (0..rgfx_data.len - intro_pattern.len) |i| {
-            if (std.mem.eql(u8, rgfx_data[i .. i + intro_pattern.len], &intro_pattern)) {
-                rgfx_patch_file_offset = i + patch_offset;
-                rgfx_file.close();
-                if (rgfx_data[rgfx_patch_file_offset] == 0x74) {
-                    if (patchByte(rgfx_exe, rgfx_patch_file_offset, 0xEB)) {
-                        rgfx_patched = true;
-                        printFmt("  Patched at offset 0x{x}: JZ->JMP (intro skip)\n", .{rgfx_patch_file_offset});
+        const PatternInfo = struct { pattern: []const u8, offset: usize, patch: []const u8, name: []const u8 };
+        const pattern_list = [_]PatternInfo{
+            .{ .pattern = &intro_pattern, .offset = intro_patch_offset, .patch = &intro_patch, .name = "intro skip (JZ->JMP)" },
+            .{ .pattern = &outro_pattern, .offset = outro_patch_offset, .patch = &outro_patch, .name = "outro skip (JMP over anims)" },
+        };
+
+        for (&pattern_list, 0..) |info, idx| {
+            if (findPattern(rgfx_data, info.pattern)) |i| {
+                const file_off = i + info.offset;
+                var ok = true;
+                for (info.patch, 0..) |byte, j| {
+                    if (!patchByte(rgfx_exe, file_off + j, byte)) {
+                        ok = false;
+                        break;
                     }
                 }
-                break :patch_intro;
+                if (ok) {
+                    patches[idx].offset = file_off;
+                    patches[idx].applied = true;
+                    printFmt("  0x{x}: {s}\n", .{ file_off, info.name });
+                }
+            } else {
+                printFmt("  Warning: pattern not found for {s}\n", .{info.name});
             }
         }
-        rgfx_file.close();
-        print("Warning: intro skip pattern not found in RGFX.EXE\n");
     }
 
     // Restore RGFX.EXE after DOSBox exits
-    defer restoreRgfx(rgfx_patched, rgfx_exe, rgfx_patch_file_offset);
+    defer {
+        var restored = false;
+        for (&patches) |*p| {
+            if (p.applied) {
+                for (p.orig, 0..) |byte, j| {
+                    if (!patchByte(rgfx_exe, p.offset + j, byte)) break;
+                }
+                p.applied = false;
+                restored = true;
+            }
+        }
+        if (restored) print("RGFX.EXE restored.\n");
+    }
 
     // Resolve hook DLL path (next to our exe)
     const self_path = try fs.selfExePathAlloc(allocator);
