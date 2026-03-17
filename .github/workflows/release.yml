@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  APP_NAME: redguard-trainer
+
+jobs:
+  build-release:
+    name: Build release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get release version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+
+      - name: Build release binary
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Build archive
+        run: |
+          staging="${APP_NAME}-v${VERSION}-x86-windows"
+          mkdir -p "$staging"
+          cp zig-out/bin/redguard-trainer.exe "$staging/"
+          cp zig-out/bin/redguard_hook.dll "$staging/"
+          zip -r "$staging.zip" "$staging"
+          echo "ASSET=$staging.zip" >> $GITHUB_ENV
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ env.VERSION }}
+          draft: true
+          generate_release_notes: true
+          files: ${{ env.ASSET }}
+
+  publish-release:
+    name: Publish release
+    needs: ['build-release']
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --draft=false

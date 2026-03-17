@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    paths:
+      - 'build.zig'
+      - 'build.zig.zon'
+      - 'src/**'
+  pull_request:
+    paths:
+      - 'build.zig'
+      - 'build.zig.zon'
+      - 'src/**'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+
+      - name: Check formatting
+        run: zig fmt --check .
+
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+
+      - name: Compile (Debug)
+        run: zig build
+
+      - name: Compile (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Verify artifacts
+        run: |
+          test -f zig-out/bin/redguard-trainer.exe || { echo "::error::redguard-trainer.exe not found"; exit 1; }
+          test -f zig-out/bin/redguard_hook.dll || { echo "::error::redguard_hook.dll not found"; exit 1; }
+          echo "Artifacts:"
+          ls -lh zig-out/bin/
