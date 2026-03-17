@@ -8,10 +8,15 @@
             .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.11.0.tar.gz",
             .hash = "clap-0.11.0-oBajB-HnAQDPCKYzwF7rO3qDFwRcD39Q0DALlTSz5H7e",
         },
+        .cimgui = .{
+            .url = "git+https://github.com/floooh/dcimgui.git#7621a8cb81ee4bb87767e6c81dc5b0bd40cfd442",
+            .hash = "cimgui-0.1.0-44ClkaTclwDxGs3Mn34j6NiB-kfbtUurNDAnJVMKWtSU",
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "vendor",
     },
 }
