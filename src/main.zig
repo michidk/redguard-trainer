@@ -33,6 +33,7 @@ extern "kernel32" fn CloseHandle(hObj: HANDLE) callconv(.winapi) BOOL;
 extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
 extern "kernel32" fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *DWORD) callconv(.winapi) DWORD;
 extern "user32" fn FindWindowA(lpClass: ?[*:0]const u8, lpWindow: ?[*:0]const u8) callconv(.winapi) ?HWND;
+extern "kernel32" fn SetEnvironmentVariableA(name: [*:0]const u8, value: ?[*:0]const u8) callconv(.winapi) BOOL;
 
 // ── Output helpers ──
 fn print(comptime msg: []const u8) void {
@@ -115,6 +116,9 @@ pub fn main() !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help            Show this help message
         \\-s, --skip-intro      Skip intro cinematic, 3dfx splash, and outro animation
+        \\-w, --windowed        Force windowed mode (default is fullscreen)
+        \\-t, --trainer         Enable trainer overlay (cheats, level loader, fly mode)
+        \\-l, --load-save <str> Load save game slot on startup (e.g. --load-save 3)
         \\<str>                 Path to Redguard installation (contains DOSBOX/ folder)
         \\
     );
@@ -130,14 +134,18 @@ pub fn main() !void {
         \\Usage: redguard-trainer [options] <game-path>
         \\
         \\Options:
-        \\  -s, --skip-intro  Skip intro cinematic, 3dfx splash, and outro animation
-        \\  -h, --help        Show this help message
+        \\  -s, --skip-intro      Skip intro cinematic, 3dfx splash, and outro animation
+        \\  -w, --windowed        Force windowed mode (default is fullscreen)
+        \\  -t, --trainer         Enable trainer overlay (cheats, level loader, fly mode)
+        \\  -l, --load-save <N>   Load save game slot N on startup (skips main menu)
+        \\  -h, --help            Show this help message
         \\
         \\Arguments:
         \\  <game-path>       Path to Redguard installation (contains DOSBOX/ folder)
         \\
         \\Example:
-        \\  redguard-trainer --skip-intro "D:\Games\GOG Galaxy\Redguard"
+        \\  redguard-trainer --skip-intro --windowed --trainer "D:\Games\GOG Galaxy\Redguard"
+        \\  redguard-trainer --skip-intro --load-save 3 "D:\Games\GOG Galaxy\Redguard"
         \\
     ;
 
@@ -157,6 +165,10 @@ pub fn main() !void {
     };
 
     const skip_intro = res.args.@"skip-intro" != 0;
+    const windowed = res.args.windowed != 0;
+    const load_save = res.args.@"load-save";
+    const trainer = res.args.trainer != 0;
+    const inject_hook = trainer or windowed or load_save != null;
 
     // ── Build paths ──
     var dosbox_exe_buf: [fs.max_path_bytes]u8 = undefined;
@@ -178,29 +190,31 @@ pub fn main() !void {
     rgfx_exe_buf[rgfx_exe.len] = 0;
 
     // ── Write temp DOSBox config ──
+    // Only override settings when explicitly requested to avoid interfering
+    // with nGlide's rendering pipeline (e.g. invisible character bug).
     {
-        const tmp_content =
-            "[sdl]\r\n" ++
-            "fullscreen=false\r\n" ++
-            "\r\n" ++
-            "[glide]\r\n" ++
-            "splash=false\r\n" ++
-            "\r\n" ++
-            "[autoexec]\r\n" ++
-            "@echo off\r\n" ++
-            "cls\r\n" ++
-            "mount C \"..\" -freesize 512\r\n" ++
-            "imgmount d \"..\\game.ins\" -t iso\r\n" ++
-            "c:\r\n" ++
-            "cd redguard\r\n" ++
-            "cls\r\n" ++
-            "rgfx.exe\r\n" ++
-            "exit\r\n";
         const file = fs.createFileAbsolute(conf_tmp, .{}) catch {
             print("Error: could not write temp config\n");
             return;
         };
-        file.writeAll(tmp_content) catch {};
+        if (windowed) {
+            file.writeAll("[sdl]\r\nfullscreen=false\r\n\r\n") catch {};
+        }
+        if (skip_intro) {
+            file.writeAll("[glide]\r\nsplash=false\r\n\r\n") catch {};
+        }
+        file.writeAll(
+            "[autoexec]\r\n" ++
+                "@echo off\r\n" ++
+                "cls\r\n" ++
+                "mount C \"..\" -freesize 512\r\n" ++
+                "imgmount d \"..\\game.ins\" -t iso\r\n" ++
+                "c:\r\n" ++
+                "cd redguard\r\n" ++
+                "cls\r\n" ++
+                "rgfx.exe\r\n" ++
+                "exit\r\n",
+        ) catch {};
         file.close();
     }
     defer fs.deleteFileAbsolute(conf_tmp) catch {};
@@ -272,17 +286,37 @@ pub fn main() !void {
     }
 
     // ── Resolve hook DLL path ──
-    const self_path = try fs.selfExePathAlloc(allocator);
-    defer allocator.free(self_path);
-    const self_dir = fs.path.dirname(self_path) orelse ".";
     var dll_buf: [fs.max_path_bytes]u8 = undefined;
-    const dll_path = std.fmt.bufPrint(&dll_buf, "{s}\\redguard_hook.dll", .{self_dir}) catch return;
-    dll_buf[dll_path.len] = 0;
+    var dll_path: []const u8 = &.{};
+    if (inject_hook) {
+        const self_path = try fs.selfExePathAlloc(allocator);
+        defer allocator.free(self_path);
+        const self_dir = fs.path.dirname(self_path) orelse ".";
+        dll_path = std.fmt.bufPrint(&dll_buf, "{s}\\redguard_hook.dll", .{self_dir}) catch return;
+        dll_buf[dll_path.len] = 0;
+    }
 
     // ── Launch ──
     printFmt("Game dir:  {s}\n", .{game_path});
     if (skip_intro) print("Intro:     SKIP\n");
+    if (windowed) print("Window:    WINDOWED\n");
+    if (trainer) print("Trainer:   ON\n");
+    if (load_save) |s| printFmt("Load save: slot {s}\n", .{s});
     print("Launching DOSBox...\n");
+
+    // Tell the hook DLL which features to enable
+    if (windowed) {
+        _ = SetEnvironmentVariableA("REDGUARD_WINDOWED", "1");
+    }
+    if (trainer) {
+        _ = SetEnvironmentVariableA("REDGUARD_TRAINER", "1");
+    }
+    if (load_save) |slot_str| {
+        // Pass the slot number string directly to the hook DLL
+        // (validated and parsed on the hook side)
+        const z: [*:0]const u8 = @ptrCast(slot_str.ptr);
+        _ = SetEnvironmentVariableA("REDGUARD_LOAD_SAVE", z);
+    }
 
     var child = std.process.Child.init(
         &.{ dosbox_exe, "-conf", conf_main, "-conf", conf_tmp, "-noconsole" },
@@ -295,24 +329,30 @@ pub fn main() !void {
     try child.spawn();
 
     // ── Wait for SDL window + inject ──
-    var hwnd: HWND = undefined;
-    while (true) {
-        if (FindWindowA("SDL_app", null)) |found| {
-            hwnd = found;
-            break;
+    if (inject_hook) {
+        var hwnd: HWND = undefined;
+        while (true) {
+            if (FindWindowA("SDL_app", null)) |found| {
+                hwnd = found;
+                break;
+            }
+            sleep(200);
         }
-        sleep(200);
+
+        var pid: DWORD = 0;
+        _ = GetWindowThreadProcessId(hwnd, &pid);
+        printFmt("DOSBox PID: {d} -- injecting hook...\n", .{pid});
+
+        injectDll(pid, dll_path[0 .. dll_path.len + 1]) catch |err| {
+            printFmt("Injection failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+
+        if (windowed)
+            print("Hook injected. Game will run windowed.\n")
+        else
+            print("Hook injected.\n");
     }
 
-    var pid: DWORD = 0;
-    _ = GetWindowThreadProcessId(hwnd, &pid);
-    printFmt("DOSBox PID: {d} — injecting hook...\n", .{pid});
-
-    injectDll(pid, dll_path[0 .. dll_path.len + 1]) catch |err| {
-        printFmt("Injection failed: {s}\n", .{@errorName(err)});
-        return;
-    };
-
-    print("Hook injected. Game will run windowed.\n");
     _ = try child.wait();
 }

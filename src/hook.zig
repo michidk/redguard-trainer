@@ -138,8 +138,10 @@ fn hookedEndScene(this: *anyopaque) callconv(.winapi) win32.HRESULT {
 // nGlide composites Glide→D3D9 output after EndScene, so we render here
 // in our own BeginScene/EndScene pair to guarantee visibility.
 fn hookedPresent(this: *anyopaque, src: ?*anyopaque, dst: ?*anyopaque, wnd: ?win32.HWND, rgn: ?*anyopaque) callconv(.winapi) win32.HRESULT {
-    // Trainer features (overlay, cheats, fly mode) only when --trainer is passed
-    if (trainer_enabled) {
+    // Hook pipeline needed for both --trainer and --load-save (the latter needs
+    // MemBase/slide detection which is set up during initImGui).
+    const needs_hooks = trainer_enabled or game.pending_load_save != null;
+    if (needs_hooks) {
         if (!imgui_initialized) {
             initImGui(this);
         }
@@ -151,20 +153,27 @@ fn hookedPresent(this: *anyopaque, src: ?*anyopaque, dst: ?*anyopaque, wnd: ?win
                 _ = game.detectGameSlide();
             }
 
-            // Update cheats (noclip, godmode)
-            game.updateCheats();
+            // Auto-load save game (runs independently of trainer overlay)
+            game.updateAutoLoadSave();
 
-            // Update fly mode (every frame, even when overlay closed)
-            game.updateFlyMode();
+            // Trainer features (overlay, cheats, fly mode) only when --trainer
+            if (trainer_enabled) {
+                // Update cheats (noclip, godmode)
+                game.updateCheats();
 
-            // Toggle overlay with ` (tilde)
-            const toggle_down = (win32.GetAsyncKeyState(win32.VK_OEM_3) & @as(c_short, -32768)) != 0;
-            if (toggle_down and !prev_toggle_down) {
-                show_overlay = !show_overlay;
+                // Update fly mode (every frame, even when overlay closed)
+                game.updateFlyMode();
+
+                // Toggle overlay with ` (tilde)
+                const toggle_down = (win32.GetAsyncKeyState(win32.VK_OEM_3) & @as(c_short, -32768)) != 0;
+                if (toggle_down and !prev_toggle_down) {
+                    show_overlay = !show_overlay;
+                }
+                prev_toggle_down = toggle_down;
             }
-            prev_toggle_down = toggle_down;
 
-            // Render ImGui in its own scene, targeting the backbuffer
+            // Render ImGui frame (needed even without trainer for the pipeline,
+            // but overlay is only drawn when trainer is active and toggled on)
             const dev_vtable: [*]*anyopaque = @as(*[*]*anyopaque, @ptrCast(@alignCast(this))).*;
             const beginScene: *const fn (*anyopaque) callconv(.winapi) win32.HRESULT = @ptrCast(dev_vtable[41]);
             _ = beginScene(this);
@@ -174,13 +183,12 @@ fn hookedPresent(this: *anyopaque, src: ?*anyopaque, dst: ?*anyopaque, wnd: ?win
             bridge_ImplWin32_NewFrame();
             ig.igNewFrame();
 
-            // When overlay is active: show cursor and release DOSBox's mouse grab
             ig.igGetIO().*.MouseDrawCursor = show_overlay;
             if (show_overlay) {
-                _ = win32.ClipCursor(null); // Release SDL mouse confinement
+                _ = win32.ClipCursor(null);
             }
 
-            if (show_overlay) {
+            if (show_overlay and trainer_enabled) {
                 overlay.drawOverlay();
             }
 
@@ -321,6 +329,27 @@ fn workerThread(_: ?*anyopaque) callconv(.winapi) win32.DWORD {
     var env_buf2: [2]u8 = undefined;
     const env_len2 = win32.GetEnvironmentVariableA("REDGUARD_TRAINER", &env_buf2, 2);
     trainer_enabled = (env_len2 > 0 and env_buf2[0] == '1');
+
+    // Check for auto-load save game (slot number as ASCII digit string)
+    var env_save_buf: [8]u8 = undefined;
+    const env_save_len = win32.GetEnvironmentVariableA("REDGUARD_LOAD_SAVE", &env_save_buf, 8);
+    if (env_save_len > 0 and env_save_len < 8) {
+        var slot: u32 = 0;
+        var valid = true;
+        var i: u32 = 0;
+        while (i < env_save_len) : (i += 1) {
+            const c = env_save_buf[i];
+            if (c >= '0' and c <= '9') {
+                slot = slot * 10 + (c - '0');
+            } else {
+                valid = false;
+                break;
+            }
+        }
+        if (valid) {
+            game.pending_load_save = slot;
+        }
+    }
 
     // Poll for d3d9.dll — nGlide loads it during initialization
     var d3d9_mod: ?*anyopaque = null;

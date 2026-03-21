@@ -44,6 +44,17 @@ pub const GAME_MAGIC_CARPET: usize = 0x001f29c4; // DAT_001f29c4: magic carpet c
 // Godmode cheat flag - disables damage when set to 1
 pub const GAME_GODMODE: usize = 0x001f29c0; // DAT_001f29c0: invulnerability cheat (1 = enabled)
 
+// Save game loading — the game's main loop checks DAT_001e9f74 every frame;
+// when it equals 0x1772, LoadGame(DAT_001f9c0c, 1) is called.
+pub const GAME_SAVE_LOAD_SLOT: usize = 0x001f9c0c; // DAT_001f9c0c: save slot number to load
+pub const GAME_SAVE_LOAD_CMD: usize = 0x001e9f74; // DAT_001e9f74: in-game command flag
+pub const LOAD_SAVE_CMD_CODE: u32 = 0x1772; // command code that triggers LoadGame
+
+// Debug mode flag — when non-zero, the main menu (FUN_000ab924) is bypassed
+// inside the game loop. Set from SYSTEM.INI "debug" key or command-line args.
+// We temporarily set this to 1 to prevent the menu from blocking the save load.
+pub const GAME_DEBUG_MODE: usize = 0x001a1df3; // DAT_001a1df3: debug/dev mode flag
+
 // ── State ──
 pub var mem_base: ?[*]u8 = null;
 pub var game_slide: isize = 0; // Offset: runtime address = ghidra address + slide
@@ -58,6 +69,11 @@ pub var fly_speed: f32 = 600.0; // Units per second
 // Cheat toggles
 pub var noclip_enabled: bool = false;
 pub var godmode_enabled: bool = false;
+
+// Auto-load save game state (set from --load-save CLI flag via env var)
+pub var pending_load_save: ?u32 = null; // save slot to load, null = no pending
+var load_save_frames: u32 = 0; // total frames since slide detected
+var load_save_written: bool = false; // true once we've started writing the command
 
 // World IDs and names from WORLD.INI (note: 9, 10, 16 don't exist)
 pub const WorldEntry = struct { id: u32, name: [*:0]const u8 };
@@ -331,6 +347,56 @@ pub fn updateCheats() void {
     } else if (!godmode_enabled and current_godmode == 1) {
         writeGameU32(GAME_GODMODE, 0);
     }
+}
+
+// ── Auto-load Save Game ──
+// The game's main menu (FUN_000ab924) is a BLOCKING call inside the world loop
+// (FUN_00053e15). While active, it overwrites DAT_001e9f74 on return, defeating
+// any writes we make to it. The menu is only called when:
+//     DAT_001a1df3 == 0 && (short)DAT_00205612 != 0
+//
+// Strategy: temporarily set DAT_001a1df3 = 1 (debug mode) to bypass the menu
+// entirely. With no menu blocking, DAT_001e9f74 = 0x1772 persists through the
+// game loop check and triggers LoadGame(DAT_001f9c0c, 1). After the save loads,
+// we restore DAT_001a1df3 = 0.
+pub fn updateAutoLoadSave() void {
+    const slot = pending_load_save orelse return;
+    if (mem_base == null or game_slide == 0) return;
+
+    load_save_frames += 1;
+
+    // Give up after ~10 seconds (600 frames) — restore debug flag and bail
+    if (load_save_frames > 600) {
+        logging.logWarn("Auto-load save: gave up after 600 frames", .{});
+        writeGameU32(GAME_DEBUG_MODE, 0);
+        pending_load_save = null;
+        load_save_frames = 0;
+        load_save_written = false;
+        return;
+    }
+
+    // If we've already started writing, check if the game processed our command.
+    // LoadGame clears DAT_001f9c0c to 0 after loading — that's our success signal.
+    if (load_save_written) {
+        const current_slot = readGameU32(GAME_SAVE_LOAD_SLOT) orelse slot;
+        if (current_slot == 0) {
+            // Success — restore normal mode
+            writeGameU32(GAME_DEBUG_MODE, 0);
+            logging.logInfo("Auto-load save slot {d}: completed", .{slot});
+            pending_load_save = null;
+            load_save_frames = 0;
+            load_save_written = false;
+            return;
+        }
+    }
+
+    // Every frame: bypass the menu and write load command.
+    // DAT_001a1df3 = 1 prevents FUN_000ab924 from being called, so our
+    // DAT_001e9f74 write survives to the 0x1772 check on the next iteration.
+    writeGameU32(GAME_DEBUG_MODE, 1);
+    writeGameU32(GAME_SAVE_LOAD_SLOT, slot);
+    writeGameU32(GAME_SAVE_LOAD_CMD, LOAD_SAVE_CMD_CODE);
+    load_save_written = true;
 }
 
 // ── Fly Mode ──
