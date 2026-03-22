@@ -219,15 +219,29 @@ pub fn main() !void {
     }
     defer fs.deleteFileAbsolute(conf_tmp) catch {};
 
-    // ── Patch RGFX.EXE (intro/outro skip) ──
+    // ── Patch RGFX.EXE (intro/outro skip, save auto-load) ──
     // Wildcard (W) on address bytes for LE relocation compatibility
     const intro_pattern = [_]u8{ 0x83, 0x3D, W, W, W, W, 0x00, 0x74, 0x0C, 0xC7, 0x45, 0xF0, 0x8A, 0x13 };
     const outro_pattern = [_]u8{ 0x75, 0x7C, 0xC6, 0x05, W, W, W, W, 0x02, 0xB9, 0x02, 0x00, 0x00, 0x00 };
+    // Save auto-load: Two binary patches bypass the menu for auto-loading.
+    //
+    // Patch 1: FUN_000ab924 (menu function) → MOV EAX,0x1771; RET
+    // Skips the blocking menu UI, returns "new game" code which triggers full
+    // game initialization (FUN_000678ce + FUN_000502f9). The Present hook then
+    // writes the LoadGame command once the game loop is active.
+    const menufn_pattern = [_]u8{ 0x53, 0x51, 0x52, 0x56, 0x57, 0x55, 0x89, 0xE5, 0x81, 0xEC, 0x48, 0x00, 0x00, 0x00, 0x89, 0x45, 0xD8 };
+    //
+    // Patch 2: JZ retarget inside FUN_00053e15's loop — redirects the menu
+    // branch past both menu paths A and B to the quit check, preventing the
+    // inner menu from blocking the game loop after the save loads.
+    const menu_jz_pattern = [_]u8{ 0x83, 0x3D, W, W, W, W, 0x00, 0x74, 0x52, 0xA1, W, W, W, W };
 
-    const PatchDef = struct { pattern: []const u8, offset: usize, patch: []const u8, orig: []const u8, name: []const u8 };
+    const PatchDef = struct { pattern: []const u8, offset: usize, patch: []const u8, orig: []const u8, name: []const u8, enabled: bool };
     const patch_defs = [_]PatchDef{
-        .{ .pattern = &intro_pattern, .offset = 7, .patch = &.{0xEB}, .orig = &.{0x74}, .name = "intro skip (JZ->JMP)" },
-        .{ .pattern = &outro_pattern, .offset = 9, .patch = &.{ 0xEB, 0x73 }, .orig = &.{ 0xB9, 0x02 }, .name = "outro skip (JMP over anims)" },
+        .{ .pattern = &intro_pattern, .offset = 7, .patch = &.{0xEB}, .orig = &.{0x74}, .name = "intro skip (JZ->JMP)", .enabled = skip_intro },
+        .{ .pattern = &outro_pattern, .offset = 9, .patch = &.{ 0xEB, 0x73 }, .orig = &.{ 0xB9, 0x02 }, .name = "outro skip (JMP over anims)", .enabled = skip_intro },
+        .{ .pattern = &menufn_pattern, .offset = 0, .patch = &.{ 0xB8, 0x71, 0x17, 0x00, 0x00, 0xC3, 0x90, 0x90 }, .orig = &.{ 0x53, 0x51, 0x52, 0x56, 0x57, 0x55, 0x89, 0xE5 }, .name = "menu fn (ret 0x1771)", .enabled = load_save != null },
+        .{ .pattern = &menu_jz_pattern, .offset = 8, .patch = &.{0x40}, .orig = &.{0x52}, .name = "menu jz retarget", .enabled = load_save != null },
     };
 
     const PatchState = struct { offset: usize, orig: []const u8, applied: bool };
@@ -236,7 +250,8 @@ pub fn main() !void {
         p.* = .{ .offset = 0, .orig = patch_defs[i].orig, .applied = false };
     }
 
-    if (skip_intro) apply_patches: {
+    const needs_patching = skip_intro or load_save != null;
+    if (needs_patching) apply_patches: {
         print("Patching RGFX.EXE...\n");
         const rgfx_file = fs.openFileAbsolute(rgfx_exe, .{ .mode = .read_write }) catch {
             print("Warning: could not open RGFX.EXE for patching\n");
@@ -251,6 +266,7 @@ pub fn main() !void {
         defer allocator.free(rgfx_data);
 
         for (&patch_defs, 0..) |def, idx| {
+            if (!def.enabled) continue;
             if (findPattern(rgfx_data, def.pattern)) |i| {
                 const file_off = i + def.offset;
                 var ok = true;

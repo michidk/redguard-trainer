@@ -382,6 +382,24 @@ fn workerThread(_: ?*anyopaque) callconv(.winapi) win32.DWORD {
     // Release temp object — vtable is shared, hook persists
     const release: *const fn (*anyopaque) callconv(.winapi) u32 = @ptrCast(vtable[2]);
     _ = release(d3d9_obj);
+
+    // If --load-save is pending, write GAME_PENDING_WORLD = 0 early so the
+    // outer loop loads a valid starting world before FUN_00053e15 enters.
+    if (game.pending_load_save != null) {
+        var mem_attempts: u32 = 0;
+        while (mem_attempts < 200) : (mem_attempts += 1) {
+            if (game.mem_base == null) game.mem_base = game.findMemBase();
+            if (game.mem_base != null and game.game_slide == 0) _ = game.detectGameSlide();
+
+            if (game.mem_base != null and game.game_slide != 0) {
+                game.writeGameU32(game.GAME_PENDING_WORLD, 0);
+                game.writeGameU32(game.GAME_PENDING_MARKER, 0);
+                break;
+            }
+            win32.Sleep(50);
+        }
+    }
+
     return 0;
 }
 
