@@ -17,6 +17,12 @@ pub const GAME_CAMERA_Z: usize = 0x002ca270; // DAT_002ca270: Z coordinate
 pub const GAME_CAMERA_YAW: usize = 0x002ca274; // DAT_002ca274: Yaw angle (horizontal rotation)
 pub const GAME_CAMERA_PITCH: usize = 0x002ca264; // DAT_002ca264: Pitch angle (vertical rotation)
 
+// Working position (source of truth — camera copies from these each frame)
+// Camera float = working_pos >> 8
+pub const GAME_WORKING_X: usize = 0x001de984; // Working X position (i32)
+pub const GAME_WORKING_Y: usize = 0x001de988; // Working Y position (i32)
+pub const GAME_WORKING_Z: usize = 0x001de98c; // Working Z position (i32)
+
 // Player entity pointer and position offsets
 pub const GAME_PLAYER_PTR: usize = 0x001a3865; // DAT_001a3865: pointer to player entity (Cyrus)
 pub const PLAYER_POS_X_OFF: usize = 0xcb; // Player X position (int, within entity struct)
@@ -37,9 +43,6 @@ pub const GAME_POS_Y: usize = 0x001de988; // DAT_001de988: current Y position (i
 pub const GAME_POS_Z: usize = 0x001de98c; // DAT_001de98c: current Z position (int)
 pub const GAME_POS_YAW: usize = 0x001de994; // DAT_001de994: working yaw (camera copies from this)
 pub const GAME_POS_PITCH: usize = 0x001de998; // DAT_001de998: working pitch
-
-// Magic carpet cheat flag - disables collision/gravity when set to 1
-pub const GAME_MAGIC_CARPET: usize = 0x001f29c4; // DAT_001f29c4: magic carpet cheat (1 = enabled)
 
 // Godmode cheat flag - disables damage when set to 1
 pub const GAME_GODMODE: usize = 0x001f29c0; // DAT_001f29c0: invulnerability cheat (1 = enabled)
@@ -66,8 +69,9 @@ pub var fly_mode_enabled: bool = false;
 pub var fly_speed: f32 = 600.0; // Units per second
 
 // Cheat toggles
-pub var noclip_enabled: bool = false;
 pub var godmode_enabled: bool = false;
+var prev_godmode: bool = false;
+var orig_godmode: u32 = 0xFFFFFFFF; // 0xFFFFFFFF = not captured yet
 
 // Auto-load save game state (set from --load-save CLI flag via env var)
 pub var pending_load_save: ?u32 = null; // save slot to load, null = no pending
@@ -332,24 +336,21 @@ pub fn detectGameSlide() bool {
 }
 
 // ── Cheat Updates ──
-// Called every frame to sync cheat flags with game memory
+// Only writes on toggle. Saves the original game value before overwriting,
+// and restores it when the cheat is disabled. DAT_001f29c0 is loaded from
+// SYSTEM.INI and may have values other than 0/1 — writing 0 breaks rendering.
 pub fn updateCheats() void {
     if (mem_base == null or game_slide == 0) return;
 
-    // Noclip (magic carpet)
-    const current_noclip = readGameU32(GAME_MAGIC_CARPET) orelse 0;
-    if (noclip_enabled and current_noclip != 1) {
-        writeGameU32(GAME_MAGIC_CARPET, 1);
-    } else if (!noclip_enabled and current_noclip == 1) {
-        writeGameU32(GAME_MAGIC_CARPET, 0);
-    }
-
     // Godmode (invulnerability)
-    const current_godmode = readGameU32(GAME_GODMODE) orelse 0;
-    if (godmode_enabled and current_godmode != 1) {
-        writeGameU32(GAME_GODMODE, 1);
-    } else if (!godmode_enabled and current_godmode == 1) {
-        writeGameU32(GAME_GODMODE, 0);
+    if (godmode_enabled != prev_godmode) {
+        if (godmode_enabled) {
+            orig_godmode = readGameU32(GAME_GODMODE) orelse 0;
+            writeGameU32(GAME_GODMODE, 1);
+        } else {
+            writeGameU32(GAME_GODMODE, if (orig_godmode != 0xFFFFFFFF) orig_godmode else 0);
+        }
+        prev_godmode = godmode_enabled;
     }
 }
 
@@ -472,9 +473,12 @@ pub fn updateFlyMode() void {
     z = @max(0.0, @min(max_pos, z));
 
     // Write to player entity position
-    writePlayerI32(PLAYER_POS_X_OFF, @intFromFloat(x));
-    writePlayerI32(PLAYER_POS_Y_OFF, @intFromFloat(y));
-    writePlayerI32(PLAYER_POS_Z_OFF, @intFromFloat(z));
+    const xi: i32 = @intFromFloat(x);
+    const yi: i32 = @intFromFloat(y);
+    const zi: i32 = @intFromFloat(z);
+    writePlayerI32(PLAYER_POS_X_OFF, xi);
+    writePlayerI32(PLAYER_POS_Y_OFF, yi);
+    writePlayerI32(PLAYER_POS_Z_OFF, zi);
 
     // Zero out velocity vectors to stop animation system from fighting us
     writePlayerI32(PLAYER_VEL1_X_OFF, 0);

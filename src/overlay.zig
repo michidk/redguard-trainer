@@ -65,8 +65,6 @@ pub fn drawOverlay() void {
         if (game.mem_base == null or game.game_slide == 0) ig.igBeginDisabled(true);
 
         _ = ig.igCheckbox("Godmode", &game.godmode_enabled);
-        ig.igSameLine();
-        _ = ig.igCheckbox("Noclip", &game.noclip_enabled);
 
         if (game.mem_base == null or game.game_slide == 0) ig.igEndDisabled();
 
