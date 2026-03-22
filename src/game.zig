@@ -44,18 +44,15 @@ pub const GAME_MAGIC_CARPET: usize = 0x001f29c4; // DAT_001f29c4: magic carpet c
 // Godmode cheat flag - disables damage when set to 1
 pub const GAME_GODMODE: usize = 0x001f29c0; // DAT_001f29c0: invulnerability cheat (1 = enabled)
 
-// Save game loading — the game's main loop checks DAT_001e9f74 every frame;
-// when it equals 0x1772, LoadGame(DAT_001f9c0c, 1) is called.
-pub const GAME_SAVE_LOAD_SLOT: usize = 0x001f9c0c; // DAT_001f9c0c: save slot number to load
-pub const GAME_SAVE_LOAD_CMD: usize = 0x001e9f74; // DAT_001e9f74: in-game command flag
-pub const LOAD_SAVE_CMD_CODE: u32 = 0x1772; // command code that triggers LoadGame
+// Save game auto-loading — FUN_000ab924 is the menu scene function. Setting
+// DAT_001fa370 = 4 during its rendering loop makes it exit with 0x1772 (load game).
+// DAT_001f9c0c holds the save slot number for LoadGame.
+pub const GAME_SAVE_LOAD_SLOT: usize = 0x001f9c0c; // DAT_001f9c0c: save slot number
+pub const GAME_MENU_SELECTION: usize = 0x001fa370; // DAT_001fa370: menu exit code (4 = load game)
 
-// "Last save" slot — checked by the outer loop at startup. When != -1, shows
-// "Load Last Game?" dialog. We set this early and patch the dialog to auto-confirm.
-pub const GAME_LAST_SAVE_SLOT: usize = 0x001a3987; // DAT_001a3987: last save game slot
-
-// Game loop counter — incremented each frame inside FUN_00053e15's loop.
-pub const GAME_LOOP_COUNTER: usize = 0x001e9f78; // DAT_001e9f78
+// Menu trigger — when (short)DAT_00205612 != 0, FUN_000ab924 is called inside
+// FUN_00053e15's loop. Writing 0 (as u16!) suppresses menu re-entry after loading.
+pub const GAME_MENU_TRIGGER: usize = 0x00205612; // DAT_00205612 (word)
 
 // ── State ──
 pub var mem_base: ?[*]u8 = null;
@@ -74,7 +71,7 @@ pub var godmode_enabled: bool = false;
 
 // Auto-load save game state (set from --load-save CLI flag via env var)
 pub var pending_load_save: ?u32 = null; // save slot to load, null = no pending
-var load_save_frames: u32 = 0; // frames since we started writing the command
+var load_save_frames: u32 = 0; // frame counter for phased write window
 
 // World IDs and names from WORLD.INI (note: 9, 10, 16 don't exist)
 pub const WorldEntry = struct { id: u32, name: [*:0]const u8 };
@@ -256,6 +253,12 @@ pub fn writeGameU32(offset: usize, value: u32) void {
     @as(*align(1) u32, @ptrCast(base + actual)).* = value;
 }
 
+pub fn writeGameU16(offset: usize, value: u16) void {
+    const base = mem_base orelse return;
+    const actual = @as(usize, @intCast(@as(isize, @intCast(offset)) + game_slide));
+    @as(*align(1) u16, @ptrCast(base + actual)).* = value;
+}
+
 pub fn writeGameF32(offset: usize, value: f32) void {
     const base = mem_base orelse return;
     const actual = @as(usize, @intCast(@as(isize, @intCast(offset)) + game_slide));
@@ -352,39 +355,40 @@ pub fn updateCheats() void {
 
 // ── Restore binary patches in emulated memory ──
 // ── Auto-load Save Game ──
-// Binary patches on RGFX.EXE bypass the menu (FUN_000ab924 → ret 0x1771 for
-// new game init, JZ retarget skips inner menu). Once FUN_00053e15's game loop
-// is active (DAT_001e9f78 > 0), we write the LoadGame command for a brief
-// window. The game processes it and loads the save.
-//
-// Note: the binary patches cannot be restored in emulated memory due to
-// DOSBox's dynamic recompiler caching translated code blocks. The Escape
-// pause menu is unavailable when --load-save is used.
+// Pure data-write approach — no binary patches, no DOSBox dynrec issues.
+// FUN_000ab924 (the menu scene) runs normally and initializes everything.
+// During its rendering loop, we write DAT_001fa370 = 4 (load game selection)
+// and DAT_001f9c0c = slot. The menu exits cleanly through its normal code
+// path, returning 0x1772 which triggers LoadGame. After the save loads,
+// we stop writing so future Escape menus work normally.
 pub fn updateAutoLoadSave() void {
     const slot = pending_load_save orelse return;
     if (mem_base == null or game_slide == 0) return;
 
-    // Before first write: wait for FUN_00053e15's loop to be running.
-    if (load_save_frames == 0) {
-        const loop_counter = readGameU32(GAME_LOOP_COUNTER) orelse return;
-        if (loop_counter < 5) return;
-    }
-
     load_save_frames += 1;
 
-    // Frames 1-10: write the load command
-    if (load_save_frames <= 10) {
+    // Phase 1 (frames 1-60): Tell the menu to exit with "Load Game".
+    // FUN_000ab924 clears DAT_001fa370 on entry, so we write every frame.
+    // After ~1 second, the menu should have processed our selection.
+    if (load_save_frames <= 60) {
+        writeGameU32(GAME_MENU_SELECTION, 4);
         writeGameU32(GAME_SAVE_LOAD_SLOT, slot);
-        writeGameU32(GAME_SAVE_LOAD_CMD, LOAD_SAVE_CMD_CODE);
         return;
     }
 
-    // Frame 60+: done (save should be loaded by now)
-    if (load_save_frames >= 60) {
-        logging.logInfo("Auto-load save slot {d}: completed", .{slot});
-        pending_load_save = null;
-        load_save_frames = 0;
+    // Phase 2 (frames 61-600): Suppress the inner menu from being called again.
+    // Without this, FUN_00053e15's loop calls FUN_000ab924 every iteration,
+    // and our phase 1 writes (now stopped) would no longer prevent re-entry.
+    // DAT_00205612 is a WORD — use u16 to avoid corrupting adjacent memory.
+    if (load_save_frames <= 600) {
+        writeGameU16(GAME_MENU_TRIGGER, 0);
+        return;
     }
+
+    // Phase 3: All done. Stop writing so Escape menu works normally.
+    logging.logInfo("Auto-load save slot {d}: completed", .{slot});
+    pending_load_save = null;
+    load_save_frames = 0;
 }
 
 // ── Fly Mode ──
